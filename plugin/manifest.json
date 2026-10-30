@@ -1,0 +1,67 @@
+{
+	"apiVersion": 2,
+	"name": "photon",
+	"nameEn": "Photon iMessage",
+	"version": "0.1.0",
+	"description": "Photon iMessage 机器人与工作台：经本机 Photon sidecar loopback HTTP 中转 iMessage 收发（Linux 可用 / 零公网 IP / 多轮会话隔离）/ 用户白名单准入 / AI photon 工具",
+	"descriptionEn": "Photon iMessage workspace & Bot: iMessage via a local Photon sidecar over loopback HTTP (works on Linux, zero public IP, isolated multi-turn sessions), access control whitelist, and AI photon tool.",
+	"author": "changeworldBT",
+	"homepage": "https://github.com/changeworldBT/pi-web-photon",
+	"icon": "💬",
+	"iconSvg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z\"/></svg>",
+	"server": "index.mjs",
+	"client": "client/entry.mjs",
+	"permissions": [
+		"ui",
+		"tools",
+		"notify",
+		"storage",
+		"secrets",
+		"llm",
+		"chat"
+	],
+	"ui": {
+		"views": [
+			{
+				"id": "photon",
+				"label": "Photon iMessage",
+				"icon": "💬"
+			}
+		],
+		"topbar": [
+			{
+				"id": "photon-open",
+				"label": "Photon iMessage",
+				"icon": "💬",
+				"action": {
+					"type": "view",
+					"viewId": "photon"
+				},
+				"order": 64
+			}
+		],
+		"statusBar": [
+			{
+				"id": "photon-status",
+				"label": "💬 Photon iMessage",
+				"title": "点击打开 Photon iMessage 工作台",
+				"action": {
+					"type": "view",
+					"viewId": "photon"
+				},
+				"order": 54
+			}
+		],
+		"commands": [
+			{
+				"id": "open",
+				"label": "打开 Photon iMessage 工作台",
+				"icon": "💬",
+				"action": {
+					"type": "view",
+					"viewId": "photon"
+				}
+			}
+		]
+	}
+}
