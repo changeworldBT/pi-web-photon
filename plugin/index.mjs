@@ -158,6 +158,31 @@ export async function photonSendAttachment(sidecar, spaceId, filePath, { caption
 }
 
 /**
+ * Send a native iMessage poll (POST /send-poll). A tap on an option streams
+ * back inbound as a poll_option event ({title, selected, pollTitle}).
+ */
+export async function photonSendPoll(sidecar, spaceId, title, options) {
+	const url = String(sidecar?.sidecarUrl || DEFAULT_SIDECAR_URL).replace(/\/+$/, "");
+	const safeSpace = String(spaceId || "").trim();
+	const safeTitle = String(title || "").trim();
+	const choices = (Array.isArray(options) ? options : []).map((o) => String(o || "").trim()).filter(Boolean);
+	if (!safeSpace) throw new Error("Photon spaceId is required.");
+	if (!safeTitle) throw new Error("Poll title is required.");
+	if (choices.length < 2) throw new Error("Poll needs at least two options.");
+	const token = sidecar.token ?? readSidecarToken(sidecar.envFile);
+	const res = await fetch(`${url}/send-poll`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json", "X-Photon-Bridge-Token": token },
+		body: JSON.stringify({ spaceId: safeSpace, title: safeTitle, options: choices }),
+	});
+	const data = await res.json().catch(() => ({}));
+	if (!res.ok || data?.ok === false) {
+		throw new Error(`Photon sidecar /send-poll failed (${res.status}): ${data?.error || res.statusText || "unknown error"}`);
+	}
+	return { messageId: data.messageId ?? null, success: true };
+}
+
+/**
  * Send an iMessage typing indicator through the sidecar (POST /typing).
  * iMessage expires the bubble after ~60s, so callers must refresh it.
  */
@@ -226,6 +251,7 @@ export default async function activate(host) {
 		helpers: {
 			photonSend,
 			photonTyping,
+			photonSendPoll,
 			readSidecarToken,
 			cleanIMessageText,
 			peerAccountId,

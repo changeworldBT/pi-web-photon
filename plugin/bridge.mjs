@@ -6,6 +6,7 @@ import { stat, writeFile, mkdtemp } from "node:fs/promises";
 // a stale cached instance (missing newly added exports).
 let photonSend;
 let photonTyping;
+let photonSendPoll;
 let readSidecarToken;
 let cleanIMessageText;
 let peerAccountId;
@@ -14,7 +15,7 @@ let chunkMarkdownText;
 let IMESSAGE_BOT_PREFIX;
 let DEFAULT_ALLOWED_USERS;
 function bindHelpers(helpers) {
-	({ photonSend, photonTyping, readSidecarToken, cleanIMessageText, peerAccountId, stripInternalMarkers, chunkMarkdownText, IMESSAGE_BOT_PREFIX, DEFAULT_ALLOWED_USERS } = helpers);
+	({ photonSend, photonTyping, photonSendPoll, readSidecarToken, cleanIMessageText, peerAccountId, stripInternalMarkers, chunkMarkdownText, IMESSAGE_BOT_PREFIX, DEFAULT_ALLOWED_USERS } = helpers);
 }
 const THINKING = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
 /** iMessage typing bubbles expire ~60s; refresh comfortably inside that. */
@@ -57,6 +58,7 @@ export class PhotonBotBridge {
 		this.dispatches = 0;
 		this.typingHandles = new Map();
 		this.sessionLists = new Map();
+		this.pendingPolls = new Map(); // key -> { kind: "switch" }
 		this.generation = 0;
 		this.userConversations = new Map();
 		this.userWorkspaces = new Map();
@@ -271,6 +273,11 @@ export class PhotonBotBridge {
 		}
 		const content = event?.content;
 		if (content?.type === "read" || content?.type === "reaction") return;
+		if (content?.type === "poll_option") {
+			await this.onPollChoice(event, { key, target });
+			return;
+		}
+		if (content?.type === "poll") return;
 		const text = cleanIMessageText(this.eventText(event));
 		if (this.eventText(event).startsWith(IMESSAGE_BOT_PREFIX)) return;
 		this.status.messagesReceived++;
@@ -410,6 +417,38 @@ export class PhotonBotBridge {
 		if (hostStreaming) return { streaming: true, label: "运行中（网页端）" };
 		return { streaming: false, label: "空闲" };
 	}
+	/** Resolve a tapped poll option against the pending poll for this chat. */
+	async onPollChoice(event, { key, target }) {
+		const pending = this.pendingPolls.get(key);
+		const title = String(event?.content?.title || "");
+		if (!pending || pending.kind !== "switch") {
+			await this.reply(target, "这个投票已过期。重新发 /sessions 获取列表。");
+			return;
+		}
+		const m = /^(\d+)\.\s*/.exec(title);
+		if (!m) {
+			await this.reply(target, `无法识别选项「${title}」。重新发 /sessions。`);
+			return;
+		}
+		this.pendingPolls.delete(key);
+		await this.switchToConversation(Number(m[1]), { key, target });
+	}
+	/** Shared switch logic for /switch <n> and poll taps. */
+	async switchToConversation(n, { key, target }) {
+		const list = this.sessionLists.get(key) || [];
+		const picked = list[n - 1] || null;
+		if (!picked) {
+			await this.reply(target, `没有第 ${n} 个会话。先发 /sessions 刷新列表。`);
+			return;
+		}
+		if ([...this.pendingRuns.values()].some((r) => r.key === key)) {
+			await this.reply(target, "当前会话仍在运行，请等待完成或使用 /stop 后再切换。");
+			return;
+		}
+		this.userConversations.set(key, picked.id);
+		const state = this.conversationState(picked.id, picked.streaming);
+		await this.reply(target, `已切换到「${picked.title}」（${state.label}）。下条消息进入该会话。`);
+	}
 	async command(text, { key, target, cfg }) {
 		const [raw, ...parts] = text.split(/\s+/),
 			cmd = raw.toLowerCase(),
@@ -480,17 +519,31 @@ export class PhotonBotBridge {
 					return;
 				}
 				const current = this.userConversations.get(key) || "";
-				const snapshot = convs.slice(0, 10);
+				const snapshot = convs.slice(0, 9);
 				this.sessionLists.set(key, snapshot);
-				const lines = snapshot.map((c, i) => {
-					const marks = [];
-					if (c.id === current) marks.push("← 当前");
-					const state = this.conversationState(c.id, c.streaming);
-					if (state.streaming) marks.push(`⏳ ${state.label}`);
-					return `${i + 1}. ${c.title}${marks.length ? `  ${marks.join(" · ")}` : ""}`;
-				});
-				const extra = convs.length > snapshot.length ? `\n（另有 ${convs.length - snapshot.length} 个未显示）` : "";
-				await this.reply(target, `📋 会话（共 ${convs.length}）\n${lines.join("\n")}${extra}\n\n/switch <序号> 切换 · /new 新建`);
+				this.pendingPolls.set(key, { kind: "switch" });
+				try {
+					await photonSendPoll(this.sidecarHandle(), target, "切换到哪个会话？", snapshot.map((c, i) => {
+						const marks = [];
+						if (c.id === current) marks.push("当前");
+						const state = this.conversationState(c.id, c.streaming);
+						if (state.streaming) marks.push("⏳");
+						return `${i + 1}. ${c.title}${marks.length ? `（${marks.join("·")}）` : ""}`;
+					}));
+					await this.reply(target, "点选上方气泡即可切换；也可 /switch <序号> 或 /new 新建。");
+				} catch (error) {
+					this.pendingPolls.delete(key);
+					// Poll unsupported (old iOS / relay limitation): fall back to text list
+					const lines = snapshot.map((c, i) => {
+						const marks = [];
+						if (c.id === current) marks.push("← 当前");
+						const state = this.conversationState(c.id, c.streaming);
+						if (state.streaming) marks.push(`⏳ ${state.label}`);
+						return `${i + 1}. ${c.title}${marks.length ? `  ${marks.join(" · ")}` : ""}`;
+					});
+					const extra = convs.length > snapshot.length ? `\n（另有 ${convs.length - snapshot.length} 个未显示）` : "";
+					await this.reply(target, `📋 会话（共 ${convs.length}）\n${lines.join("\n")}${extra}\n\n/switch <序号> 切换 · /new 新建\n（投票气泡不可用，已回退文本列表：${error.message}）`);
+				}
 				return;
 			}
 			case "/switch": {
@@ -498,18 +551,18 @@ export class PhotonBotBridge {
 					await this.reply(target, "用法：/switch <序号>（先发 /sessions 看列表）或 /switch <会话ID>");
 					return;
 				}
-				if ([...this.pendingRuns.values()].some((r) => r.key === key)) {
-					await this.reply(target, "当前会话仍在运行，请等待完成或使用 /stop 后再切换。");
+				if (/^\d+$/.test(arg)) {
+					await this.switchToConversation(Number(arg), { key, target });
 					return;
 				}
-				const list = this.sessionLists.get(key) || [];
-				let picked = /^\d+$/.test(arg) ? list[Number(arg) - 1] : null;
-				if (!picked && !/^\d+$/.test(arg)) {
-					const convs = await this.listLiveConversations();
-					picked = convs.find((c) => c.id === arg) || null;
-				}
+				const convs = await this.listLiveConversations();
+				const picked = convs.find((c) => c.id === arg) || null;
 				if (!picked) {
-					await this.reply(target, `没有第 ${arg} 个会话。先发 /sessions 刷新列表。`);
+					await this.reply(target, `没有会话 ${arg}。先发 /sessions 刷新列表。`);
+					return;
+				}
+				if ([...this.pendingRuns.values()].some((r) => r.key === key)) {
+					await this.reply(target, "当前会话仍在运行，请等待完成或使用 /stop 后再切换。");
 					return;
 				}
 				this.userConversations.set(key, picked.id);
