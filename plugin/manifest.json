@@ -2,7 +2,7 @@
 	"apiVersion": 2,
 	"name": "photon",
 	"nameEn": "Photon iMessage",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "Photon iMessage 机器人与工作台：经本机 Photon sidecar loopback HTTP 中转 iMessage 收发（Linux 可用 / 零公网 IP / 多轮会话隔离）/ 用户白名单准入 / AI photon 工具",
 	"descriptionEn": "Photon iMessage workspace & Bot: iMessage via a local Photon sidecar over loopback HTTP (works on Linux, zero public IP, isolated multi-turn sessions), access control whitelist, and AI photon tool.",
 	"author": "changeworldBT",
