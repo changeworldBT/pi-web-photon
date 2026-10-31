@@ -58,7 +58,7 @@ export class PhotonBotBridge {
 		this.dispatches = 0;
 		this.typingHandles = new Map();
 		this.sessionLists = new Map();
-		this.pendingPolls = new Map(); // key -> { kind: "switch" }
+		this.pendingPolls = new Map(); // key -> { kind: "switch" | "close" }
 		this.generation = 0;
 		this.userConversations = new Map();
 		this.userWorkspaces = new Map();
@@ -421,13 +421,32 @@ export class PhotonBotBridge {
 	async onPollChoice(event, { key, target }) {
 		const pending = this.pendingPolls.get(key);
 		const title = String(event?.content?.title || "");
-		if (!pending || pending.kind !== "switch") {
+		// A newer poll in the same chat overwrites `pending`, so a tap on the
+		// old bubble would otherwise be parsed under the new poll's kind.
+		// Each tap carries the pollTitle it belongs to — cross-check it.
+		const pollTitle = String(event?.content?.pollTitle || "");
+		if (pollTitle && ((pending?.kind === "switch" && pollTitle.startsWith("移出哪个")) ||
+			(pending?.kind === "close" && pollTitle.startsWith("切换到哪个")))) {
 			await this.reply(target, "这个投票已过期。重新发 /sessions 获取列表。");
+			return;
+		}
+		if (!pending || (pending.kind !== "switch" && pending.kind !== "close")) {
+			await this.reply(target, "这个投票已过期。重新发 /sessions 获取列表。");
+			return;
+		}
+		// The switch poll ends with a "✕ 移出会话…" item that opens the dismiss
+		// poll instead of switching. Matched by its text, not by its index.
+		if (pending.kind === "switch" && title.startsWith("✕")) {
+			await this.startDismissPoll(key, target);
 			return;
 		}
 		const m = /^(\d+)\.\s*/.exec(title);
 		if (!m) {
 			await this.reply(target, `无法识别选项「${title}」。重新发 /sessions。`);
+			return;
+		}
+		if (pending.kind === "close") {
+			await this.dismissConversationByIndex(Number(m[1]), { key, target });
 			return;
 		}
 		this.pendingPolls.delete(key);
@@ -448,6 +467,60 @@ export class PhotonBotBridge {
 		this.userConversations.set(key, picked.id);
 		const state = this.conversationState(picked.id, picked.streaming);
 		await this.reply(target, `已切换到「${picked.title}」（${state.label}）。下条消息进入该会话。`);
+	}
+	/** Second poll opened from the "✕ 移出会话" item: pick the conversation to
+	 *  dismiss. Running conversations stay listed and are refused when tapped. */
+	async startDismissPoll(key, target) {
+		// 7 rows + nothing extra stays safely inside the unknown poll cap.
+		const snapshot = (this.sessionLists.get(key) || []).slice(0, 7);
+		this.pendingPolls.set(key, { kind: "close" });
+		try {
+			await photonSendPoll(this.sidecarHandle(), target, "移出哪个会话？（移出后可从历史/网页端重开）", snapshot.map((c, i) => {
+				const state = this.conversationState(c.id, c.streaming);
+				return `${i + 1}. ${c.title}${state.streaming ? "（⏳ 运行中）" : ""}`;
+			}));
+		} catch {
+			this.pendingPolls.delete(key);
+			// Poll unsupported: show the list as text and point at the web UI.
+			const lines = snapshot.map((c, i) => {
+				const state = this.conversationState(c.id, c.streaming);
+				return `${i + 1}. ${c.title}${state.streaming ? `（⏳ ${state.label}）` : ""}`;
+			});
+			await this.reply(target, `移出会话（共 ${snapshot.length}）\n${lines.join("\n")}\n\n投票不可用，请在网页端移出。`);
+		}
+	}
+	/** Dismiss the conversation picked from the dismiss poll. */
+	async dismissConversationByIndex(n, { key, target }) {
+		const picked = (this.sessionLists.get(key) || [])[n - 1] || null;
+		if (!picked) {
+			this.pendingPolls.delete(key);
+			await this.reply(target, `没有第 ${n} 个会话。重新发 /sessions。`);
+			return;
+		}
+		if (this.conversationState(picked.id, picked.streaming).streaming) {
+			// Keep the close poll pending so the user can pick another one.
+			await this.reply(target, `「${picked.title}」正在运行，请先 /stop 再移出。`);
+			return;
+		}
+		this.pendingPolls.delete(key);
+		let result;
+		try {
+			result = await this.host.dismissConversation?.(picked.id);
+		} catch (error) {
+			await this.reply(target, `移出失败：${error.message}`);
+			return;
+		}
+		if (!result?.ok) {
+			await this.reply(target, `移出失败：${result?.error || "宿主不支持"}`);
+			return;
+		}
+		// Drop the chat binding too, or later messages target a dead conversation.
+		if ((this.userConversations.get(key) || "") === picked.id) this.userConversations.delete(key);
+		// Remove it from the cached snapshot too, or re-tapping that row would
+		// dismiss a second conversation by the same stale index.
+		const list = this.sessionLists.get(key);
+		if (list) this.sessionLists.set(key, list.filter((c) => c.id !== picked.id));
+		await this.reply(target, `已移出「${picked.title}」。转录保留，可从网页端历史重开。`);
 	}
 	async command(text, { key, target, cfg }) {
 		const [raw, ...parts] = text.split(/\s+/),
@@ -550,6 +623,20 @@ export class PhotonBotBridge {
 				await this.reply(target, `已切换到「${picked.title}」（${state.label}）。下条消息进入该会话。`);
 				return;
 			}
+
+			case "/remove":
+			case "/rm": {
+				if (!this.sessionLists.get(key)?.length) {
+					const convs = await this.listLiveConversations();
+					if (convs.length) this.sessionLists.set(key, convs);
+				}
+				if (!(this.sessionLists.get(key) || []).length) {
+					await this.reply(target, "没有可移出的会话。");
+					return;
+				}
+				await this.startDismissPoll(key, target);
+				return;
+			}
 			case "/status": {
 				const current = this.userConversations.get(key) || "";
 				let title = "尚未创建";
@@ -633,17 +720,22 @@ export class PhotonBotBridge {
 		const convs = await this.listLiveConversations();
 		if (convs.length < 2) return; // nothing to hop between
 		const current = this.userConversations.get(key) || "";
-		const snapshot = convs.slice(0, 9);
+		// 7 rows + the dismiss toggle = 8 options: safe under any known
+		// provider cap while the upstream limit is unverified.
+		const snapshot = convs.slice(0, 7);
 		this.sessionLists.set(key, snapshot);
 		this.pendingPolls.set(key, { kind: "switch" });
 		try {
-			await photonSendPoll(this.sidecarHandle(), target, "切换到哪个会话？", snapshot.map((c, i) => {
-				const marks = [];
-				if (c.id === current) marks.push("当前");
-				const state = this.conversationState(c.id, c.streaming);
-				if (state.streaming) marks.push("⏳");
-				return `${i + 1}. ${c.title}${marks.length ? `（${marks.join("·")}）` : ""}`;
-			}));
+			await photonSendPoll(this.sidecarHandle(), target, "切换到哪个会话？", [
+				...snapshot.map((c, i) => {
+					const marks = [];
+					if (c.id === current) marks.push("当前");
+					const state = this.conversationState(c.id, c.streaming);
+					if (state.streaming) marks.push("⏳");
+					return `${i + 1}. ${c.title}${marks.length ? `（${marks.join("·")}）` : ""}`;
+				}),
+				"✕ 移出会话（点此进入移出模式）",
+			]);
 		} catch (error) {
 			this.pendingPolls.delete(key);
 			// Poll unsupported: fall back to the text list so the chat still works.
@@ -655,7 +747,7 @@ export class PhotonBotBridge {
 				return `${i + 1}. ${c.title}${marks.length ? `  ${marks.join(" · ")}` : ""}`;
 			});
 			const extra = convs.length > snapshot.length ? `\n（另有 ${convs.length - snapshot.length} 个未显示）` : "";
-			await this.reply(target, `📋 会话（共 ${convs.length}）\n${lines.join("\n")}${extra}\n\n/switch <序号> 切换`);
+			await this.reply(target, `📋 会话（共 ${convs.length}）\n${lines.join("\n")}${extra}\n\n/switch <序号> 切换\n投票不可用，移出请到网页端左栏点 ✕。`);
 		}
 	}
 }
