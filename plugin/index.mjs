@@ -155,6 +155,28 @@ export async function photonSendAttachment(sidecar, spaceId, filePath, { caption
 }
 
 /**
+ * Send an iMessage typing indicator through the sidecar (POST /typing).
+ * iMessage expires the bubble after ~60s, so callers must refresh it.
+ */
+export async function photonTyping(sidecar, spaceId, state = "start") {
+	const url = String(sidecar?.sidecarUrl || DEFAULT_SIDECAR_URL).replace(/\/+$/, "");
+	const safeSpace = String(spaceId || "").trim();
+	if (!safeSpace) throw new Error("Photon spaceId is required.");
+	if (state !== "start" && state !== "stop") throw new Error('typing state must be "start" or "stop".');
+	const token = sidecar.token ?? readSidecarToken(sidecar.envFile);
+	const res = await fetch(`${url}/typing`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json", "X-Photon-Bridge-Token": token },
+		body: JSON.stringify({ spaceId: safeSpace, state }),
+	});
+	const data = await res.json().catch(() => ({}));
+	if (!res.ok || data?.ok === false) {
+		throw new Error(`Photon sidecar /typing failed (${res.status}): ${data?.error || res.statusText || "unknown error"}`);
+	}
+	return { success: true };
+}
+
+/**
  * One authenticated sidecar request; used by test_config against POST /healthz.
  */
 export async function sidecarRequest(sidecar, path, { method = "POST", body } = {}) {

@@ -4,6 +4,7 @@ import { stat, writeFile, mkdtemp } from "node:fs/promises";
 import { chunkMarkdownText } from "./markdown-chunks.mjs";
 import {
 	photonSend,
+	photonTyping,
 	readSidecarToken,
 	cleanIMessageText,
 	peerAccountId,
@@ -12,6 +13,8 @@ import {
 	DEFAULT_ALLOWED_USERS,
 } from "./index.mjs";
 const THINKING = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
+/** iMessage typing bubbles expire ~60s; refresh comfortably inside that. */
+const TYPING_REFRESH_MS = 45_000;
 
 // No public inbound API from Photon: consume the local sidecar's GET /inbound
 // NDJSON long stream (blank lines are heartbeats); never talk to the cloud directly.
@@ -47,6 +50,7 @@ export class PhotonBotBridge {
 		this.pendingRuns = new Map();
 		this.earlyRuns = new Map();
 		this.dispatches = 0;
+		this.typingHandles = new Map();
 		this.generation = 0;
 		this.userConversations = new Map();
 		this.userWorkspaces = new Map();
@@ -75,6 +79,37 @@ export class PhotonBotBridge {
 	}
 	sidecarToken() {
 		return readSidecarToken(this.getConfig()?.envFile);
+	}
+	/** Sidecar handle for send/typing calls (url + token source). */
+	sidecarHandle() {
+		return { sidecarUrl: this.sidecarUrl(), envFile: this.getConfig()?.envFile };
+	}
+	/**
+	 * Start the "typing…" bubble for a space and keep it alive. iMessage drops
+	 * the indicator after ~60s, so refresh well inside that window. Returns a
+	 * stop() that cancels the refresh and clears the bubble.
+	 */
+	beginTyping(target) {
+		const space = String(target || "").trim();
+		if (!space) return () => {};
+		const existing = this.typingHandles.get(space);
+		if (existing) return existing;
+		const sidecar = this.sidecarHandle();
+		const ping = () => {
+			photonTyping(sidecar, space, "start").catch((error) => {
+				this.log("warn", `typing indicator failed: ${error.message}`);
+			});
+		};
+		ping();
+		const timer = setInterval(ping, TYPING_REFRESH_MS);
+		timer.unref?.();
+		const stop = () => {
+			clearInterval(timer);
+			this.typingHandles.delete(space);
+			photonTyping(sidecar, space, "stop").catch(() => {});
+		};
+		this.typingHandles.set(space, stop);
+		return stop;
 	}
 	async reply(target, text) {
 		try {
@@ -112,6 +147,14 @@ export class PhotonBotBridge {
 		this.offRunEvent = null;
 		this.pendingRuns.clear();
 		this.earlyRuns.clear();
+		for (const stop of [...this.typingHandles.values()]) {
+			try {
+				stop();
+			} catch {
+				/* best effort */
+			}
+		}
+		this.typingHandles.clear();
 		this.status.enabled = false;
 		this.status.connected = false;
 		this.status.state = "idle";
@@ -229,97 +272,107 @@ export class PhotonBotBridge {
 			await this.command(text, { key, target, cfg });
 			return;
 		}
-		const cancelEpoch = this.cancelEpochs.get(key) || 0;
-		const attachments = [];
-		let imageBytes = 0,
-			imageCount = 0;
-		const contentItems =
-			content?.type === "group" ? (Array.isArray(content.items) ? content.items : []).map((item) => item?.content) : content ? [content] : [];
-		for (const item of contentItems) {
-			if (!item || typeof item !== "object") continue;
-			if (item.type === "text" || item.type === "richlink") continue;
-			if (item.type !== "attachment" && item.type !== "voice") {
-				await this.reply(
-					target,
-					`不支持或无法识别的附件类型：${String(item?.type || "未知类型")}。请发送文字、PNG/JPEG/GIF/WebP 图片或常见文件。`,
-				);
-				continue;
-			}
-			const mime = String(item.mimeType || "");
-			if (!item.data) {
-				await this.reply(target, `附件过大或未携带内容（超过 sidecar 内联上限），无法读取：${String(item.name || "未命名")}`);
-				return;
-			}
-			try {
-				const path = await this.writeTempAttachment(item.data, item.name, mime);
-				const name = String(item.name || path.split(/[\\/]/).pop());
-				if (item.type !== "voice" && /^image\/(png|jpeg|gif|webp)$/.test(mime)) {
-					const info = await stat(path);
-					if (info.size > 10 * 1024 * 1024) throw new Error("image exceeds 10 MiB");
-					if (++imageCount > 8 || (imageBytes += info.size) > 20 * 1024 * 1024)
-						throw new Error("images exceed 8 items or 20 MiB total");
-					attachments.push({ path: "", imageData: item.data, mimeType: mime, name });
-				} else if (item.type === "voice" || /^(audio\/|video\/|text\/|application\/)/.test(mime)) {
-					attachments.push({ path, mode: "reference", name });
-					if (item.type === "voice" || /^(audio|video)\//.test(mime))
-						await this.reply(
-							target,
-							"已接收音视频文件，将作为附件交给模型；是否能转录或理解取决于模型与可用工具，不保证自动解码。",
-						);
-				} else {
+		// Acknowledge receipt visually: the bubble shows up while we still read
+		// attachments and before the model starts, so the sender can tell the
+		// bridge is alive rather than dead.
+		const stopTyping = this.beginTyping(target);
+		let typingOwnedByRun = false;
+		try {
+			const cancelEpoch = this.cancelEpochs.get(key) || 0;
+			const attachments = [];
+			let imageBytes = 0,
+				imageCount = 0;
+			const contentItems =
+				content?.type === "group" ? (Array.isArray(content.items) ? content.items : []).map((item) => item?.content) : content ? [content] : [];
+			for (const item of contentItems) {
+				if (!item || typeof item !== "object") continue;
+				if (item.type === "text" || item.type === "richlink") continue;
+				if (item.type !== "attachment" && item.type !== "voice") {
 					await this.reply(
 						target,
-						`不支持或无法识别的附件类型：${mime || "未知类型"}。请发送文字、PNG/JPEG/GIF/WebP 图片或常见文件。`,
+						`不支持或无法识别的附件类型：${String(item?.type || "未知类型")}。请发送文字、PNG/JPEG/GIF/WebP 图片或常见文件。`,
 					);
+					continue;
 				}
+				const mime = String(item.mimeType || "");
+				if (!item.data) {
+					await this.reply(target, `附件过大或未携带内容（超过 sidecar 内联上限），无法读取：${String(item.name || "未命名")}`);
+					return;
+				}
+				try {
+					const path = await this.writeTempAttachment(item.data, item.name, mime);
+					const name = String(item.name || path.split(/[\\/]/).pop());
+					if (item.type !== "voice" && /^image\/(png|jpeg|gif|webp)$/.test(mime)) {
+						const info = await stat(path);
+						if (info.size > 10 * 1024 * 1024) throw new Error("image exceeds 10 MiB");
+						if (++imageCount > 8 || (imageBytes += info.size) > 20 * 1024 * 1024)
+							throw new Error("images exceed 8 items or 20 MiB total");
+						attachments.push({ path: "", imageData: item.data, mimeType: mime, name });
+					} else if (item.type === "voice" || /^(audio\/|video\/|text\/|application\/)/.test(mime)) {
+						attachments.push({ path, mode: "reference", name });
+						if (item.type === "voice" || /^(audio|video)\//.test(mime))
+							await this.reply(
+								target,
+								"已接收音视频文件，将作为附件交给模型；是否能转录或理解取决于模型与可用工具，不保证自动解码。",
+							);
+					} else {
+						await this.reply(
+							target,
+							`不支持或无法识别的附件类型：${mime || "未知类型"}。请发送文字、PNG/JPEG/GIF/WebP 图片或常见文件。`,
+						);
+					}
+				} catch (error) {
+					await this.reply(target, `附件读取失败：${error.message}`);
+					return;
+				}
+			}
+			if (generation !== this.generation || cancelEpoch !== (this.cancelEpochs.get(key) || 0)) return;
+			if (!text && !attachments.length) {
+				if (!contentItems.length) await this.reply(target, "此消息无可读取正文（可能为 Apple 富文本），请重发为纯文本。");
+				return;
+			}
+			if ([...this.pendingRuns.values()].some((r) => r.key === key)) {
+				await this.reply(target, "当前会话仍在运行，请等待完成或使用 /stop。");
+				return;
+			}
+			const run = { key, target, text: "", conversationId: this.userConversations.get(key), runId: null, stopTyping };
+			this.dispatches++;
+			try {
+				const opts = this.settings.get(key) || {};
+				const receipt = await this.host.chat({
+					text: text || "请查看附件",
+					accountId: peerAccountId(`${key}:${this.sessionEpochs.get(key) || 0}`),
+					...(run.conversationId ? { conversationId: run.conversationId } : {}),
+					cwd: this.resolveWorkspace(key, cfg),
+					...(cfg.model ? { model: cfg.model } : {}),
+					...(cfg.thinkingLevel ? { thinkingLevel: cfg.thinkingLevel } : {}),
+					...opts,
+					...(attachments.length ? { attachments } : {}),
+				});
+				if (generation !== this.generation) return;
+				if (cancelEpoch !== (this.cancelEpochs.get(key) || 0)) {
+					if (receipt?.conversationId) await this.host.abortRun?.(receipt.runId || receipt.conversationId);
+					return;
+				}
+				if (!receipt?.conversationId) throw new Error("Host returned no conversation ID");
+				run.conversationId = receipt.conversationId;
+				run.runId = receipt.runId;
+				this.userConversations.set(key, receipt.conversationId);
+				const token = receipt.runId || receipt.conversationId;
+				this.pendingRuns.set(token, run);
+				typingOwnedByRun = true;
+				const early = this.earlyRuns.get(token) || [];
+				this.earlyRuns.delete(token);
+				for (const ev of early) await this.handleRunEvent(ev);
 			} catch (error) {
-				await this.reply(target, `附件读取失败：${error.message}`);
-				return;
+				if (generation !== this.generation) return;
+				await this.reply(target, `任务启动失败：${error.message}`);
+			} finally {
+				this.dispatches--;
+				if (!this.dispatches) this.earlyRuns.clear();
 			}
-		}
-		if (generation !== this.generation || cancelEpoch !== (this.cancelEpochs.get(key) || 0)) return;
-		if (!text && !attachments.length) {
-			if (!contentItems.length) await this.reply(target, "此消息无可读取正文（可能为 Apple 富文本），请重发为纯文本。");
-			return;
-		}
-		if ([...this.pendingRuns.values()].some((r) => r.key === key)) {
-			await this.reply(target, "当前会话仍在运行，请等待完成或使用 /stop。");
-			return;
-		}
-		const run = { key, target, text: "", conversationId: this.userConversations.get(key), runId: null };
-		this.dispatches++;
-		try {
-			const opts = this.settings.get(key) || {};
-			const receipt = await this.host.chat({
-				text: text || "请查看附件",
-				accountId: peerAccountId(`${key}:${this.sessionEpochs.get(key) || 0}`),
-				...(run.conversationId ? { conversationId: run.conversationId } : {}),
-				cwd: this.resolveWorkspace(key, cfg),
-				...(cfg.model ? { model: cfg.model } : {}),
-				...(cfg.thinkingLevel ? { thinkingLevel: cfg.thinkingLevel } : {}),
-				...opts,
-				...(attachments.length ? { attachments } : {}),
-			});
-			if (generation !== this.generation) return;
-			if (cancelEpoch !== (this.cancelEpochs.get(key) || 0)) {
-				if (receipt?.conversationId) await this.host.abortRun?.(receipt.runId || receipt.conversationId);
-				return;
-			}
-			if (!receipt?.conversationId) throw new Error("Host returned no conversation ID");
-			run.conversationId = receipt.conversationId;
-			run.runId = receipt.runId;
-			this.userConversations.set(key, receipt.conversationId);
-			const token = receipt.runId || receipt.conversationId;
-			this.pendingRuns.set(token, run);
-			const early = this.earlyRuns.get(token) || [];
-			this.earlyRuns.delete(token);
-			for (const ev of early) await this.handleRunEvent(ev);
-		} catch (error) {
-			if (generation !== this.generation) return;
-			await this.reply(target, `任务启动失败：${error.message}`);
 		} finally {
-			this.dispatches--;
-			if (!this.dispatches) this.earlyRuns.clear();
+			if (!typingOwnedByRun) stopTyping();
 		}
 	}
 	async command(text, { key, target, cfg }) {
@@ -434,6 +487,11 @@ export class PhotonBotBridge {
 		}
 		if (ev.type !== "run_end") return;
 		this.pendingRuns.delete(token);
+		try {
+			run.stopTyping?.();
+		} catch {
+			/* best effort */
+		}
 		this.userConversations.set(run.key, run.conversationId);
 		const text =
 			stripInternalMarkers(run.text) ||
