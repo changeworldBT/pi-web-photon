@@ -626,12 +626,6 @@ export class PhotonBotBridge {
 					: "任务完成，无文本输出。附件不会自动发送，请使用 photon 工具的 file 参数。");
 		for (const chunk of chunkMarkdownText(text, 3000)) await this.reply(run.target, chunk);
 		this.status.messagesReplied++;
-		// Attach a fresh session-picker poll after every run so the user can
-		// hop to another conversation with one tap (never appended to command
-		// replies or short notices — only completed agent runs).
-		void this.sendSessionPoll(run.key, run.target).catch((error) => {
-			this.log("warn", `session poll after run failed: ${error.message}`);
-		});
 	}
 	/** Send the conversation-picker poll for a chat (used by /sessions and
 	 *  the post-run attach). Returns quietly when nothing is routable. */
