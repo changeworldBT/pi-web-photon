@@ -14,6 +14,9 @@ import { readFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { chunkMarkdownText } from "./markdown-chunks.mjs";
+
+export { chunkMarkdownText };
 
 export const IMESSAGE_BOT_PREFIX = "🤖 PI\n";
 
@@ -220,6 +223,17 @@ export default async function activate(host) {
 
 	const PhotonBotBridge = await loadPhotonBotBridge();
 	const botBridge = new PhotonBotBridge({
+		helpers: {
+			photonSend,
+			photonTyping,
+			readSidecarToken,
+			cleanIMessageText,
+			peerAccountId,
+			stripInternalMarkers,
+			chunkMarkdownText,
+			IMESSAGE_BOT_PREFIX,
+			DEFAULT_ALLOWED_USERS,
+		},
 		host,
 		getConfig: () => localConfig,
 		log: (lvl, msg) => host.log?.(lvl, msg),

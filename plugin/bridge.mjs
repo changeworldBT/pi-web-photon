@@ -1,17 +1,21 @@
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { stat, writeFile, mkdtemp } from "node:fs/promises";
-import { chunkMarkdownText } from "./markdown-chunks.mjs";
-import {
-	photonSend,
-	photonTyping,
-	readSidecarToken,
-	cleanIMessageText,
-	peerAccountId,
-	stripInternalMarkers,
-	IMESSAGE_BOT_PREFIX,
-	DEFAULT_ALLOWED_USERS,
-} from "./index.mjs";
+// Helpers are injected by index.mjs instead of imported from it: the host busts
+// only index.mjs on reload, so a static ./index.mjs import here would resolve to
+// a stale cached instance (missing newly added exports).
+let photonSend;
+let photonTyping;
+let readSidecarToken;
+let cleanIMessageText;
+let peerAccountId;
+let stripInternalMarkers;
+let chunkMarkdownText;
+let IMESSAGE_BOT_PREFIX;
+let DEFAULT_ALLOWED_USERS;
+function bindHelpers(helpers) {
+	({ photonSend, photonTyping, readSidecarToken, cleanIMessageText, peerAccountId, stripInternalMarkers, chunkMarkdownText, IMESSAGE_BOT_PREFIX, DEFAULT_ALLOWED_USERS } = helpers);
+}
 const THINKING = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
 /** iMessage typing bubbles expire ~60s; refresh comfortably inside that. */
 const TYPING_REFRESH_MS = 45_000;
@@ -38,6 +42,7 @@ const EXT_BY_MIME = {
 export class PhotonBotBridge {
 	/** @param {{host?: any, getConfig?: any, log?: any, fetchImpl?: any, platform?: string}} options */
 	constructor({ host, getConfig, log, fetchImpl, platform = process.platform } = {}) {
+		if (arguments[0]?.helpers) bindHelpers(arguments[0].helpers);
 		Object.assign(this, { host, getConfig, fetchImpl });
 		this.log = log || (() => {});
 		this.running = false;
