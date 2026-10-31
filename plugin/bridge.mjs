@@ -513,36 +513,16 @@ export class PhotonBotBridge {
 				break;
 			case "/sessions":
 			case "/list": {
-				const convs = await this.listLiveConversations();
-				if (!convs.length) {
-					await this.reply(target, "没有可切换的会话。发条消息或 /new 新建一个。");
-					return;
-				}
-				const current = this.userConversations.get(key) || "";
-				const snapshot = convs.slice(0, 9);
-				this.sessionLists.set(key, snapshot);
-				this.pendingPolls.set(key, { kind: "switch" });
 				try {
-					await photonSendPoll(this.sidecarHandle(), target, "切换到哪个会话？", snapshot.map((c, i) => {
-						const marks = [];
-						if (c.id === current) marks.push("当前");
-						const state = this.conversationState(c.id, c.streaming);
-						if (state.streaming) marks.push("⏳");
-						return `${i + 1}. ${c.title}${marks.length ? `（${marks.join("·")}）` : ""}`;
-					}));
+					await this.sendSessionPoll(key, target);
+					if (!this.pendingPolls.has(key)) {
+						await this.reply(target, "没有可切换的会话。发条消息或 /new 新建一个。");
+						return;
+					}
 					await this.reply(target, "点选上方气泡即可切换；也可 /switch <序号> 或 /new 新建。");
 				} catch (error) {
 					this.pendingPolls.delete(key);
-					// Poll unsupported (old iOS / relay limitation): fall back to text list
-					const lines = snapshot.map((c, i) => {
-						const marks = [];
-						if (c.id === current) marks.push("← 当前");
-						const state = this.conversationState(c.id, c.streaming);
-						if (state.streaming) marks.push(`⏳ ${state.label}`);
-						return `${i + 1}. ${c.title}${marks.length ? `  ${marks.join(" · ")}` : ""}`;
-					});
-					const extra = convs.length > snapshot.length ? `\n（另有 ${convs.length - snapshot.length} 个未显示）` : "";
-					await this.reply(target, `📋 会话（共 ${convs.length}）\n${lines.join("\n")}${extra}\n\n/switch <序号> 切换 · /new 新建\n（投票气泡不可用，已回退文本列表：${error.message}）`);
+					await this.reply(target, `会话列表发送失败：${error.message}`);
 				}
 				return;
 			}
@@ -646,5 +626,42 @@ export class PhotonBotBridge {
 					: "任务完成，无文本输出。附件不会自动发送，请使用 photon 工具的 file 参数。");
 		for (const chunk of chunkMarkdownText(text, 3000)) await this.reply(run.target, chunk);
 		this.status.messagesReplied++;
+		// Attach a fresh session-picker poll after every run so the user can
+		// hop to another conversation with one tap (never appended to command
+		// replies or short notices — only completed agent runs).
+		void this.sendSessionPoll(run.key, run.target).catch((error) => {
+			this.log("warn", `session poll after run failed: ${error.message}`);
+		});
+	}
+	/** Send the conversation-picker poll for a chat (used by /sessions and
+	 *  the post-run attach). Returns quietly when nothing is routable. */
+	async sendSessionPoll(key, target) {
+		const convs = await this.listLiveConversations();
+		if (convs.length < 2) return; // nothing to hop between
+		const current = this.userConversations.get(key) || "";
+		const snapshot = convs.slice(0, 9);
+		this.sessionLists.set(key, snapshot);
+		this.pendingPolls.set(key, { kind: "switch" });
+		try {
+			await photonSendPoll(this.sidecarHandle(), target, "切换到哪个会话？", snapshot.map((c, i) => {
+				const marks = [];
+				if (c.id === current) marks.push("当前");
+				const state = this.conversationState(c.id, c.streaming);
+				if (state.streaming) marks.push("⏳");
+				return `${i + 1}. ${c.title}${marks.length ? `（${marks.join("·")}）` : ""}`;
+			}));
+		} catch (error) {
+			this.pendingPolls.delete(key);
+			// Poll unsupported: fall back to the text list so the chat still works.
+			const lines = snapshot.map((c, i) => {
+				const marks = [];
+				if (c.id === current) marks.push("← 当前");
+				const state = this.conversationState(c.id, c.streaming);
+				if (state.streaming) marks.push(`⏳ ${state.label}`);
+				return `${i + 1}. ${c.title}${marks.length ? `  ${marks.join(" · ")}` : ""}`;
+			});
+			const extra = convs.length > snapshot.length ? `\n（另有 ${convs.length - snapshot.length} 个未显示）` : "";
+			await this.reply(target, `📋 会话（共 ${convs.length}）\n${lines.join("\n")}${extra}\n\n/switch <序号> 切换`);
+		}
 	}
 }
