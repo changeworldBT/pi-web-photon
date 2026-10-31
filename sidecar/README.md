@@ -26,6 +26,13 @@ are proxied through this sidecar over a loopback HTTP control channel.
 
 All routes except `/healthz` require the shared token header.
 
+## Patches
+
+`npm ci` runs `patch-spectrum-mixed-attachments.mjs` (postinstall) which fixes two upstream `spectrum-ts` issues:
+
+1. mixed text + attachment Apple messages are dropped as attachment-only;
+2. polls whose cloud metadata carries an empty `title` throw in zod and silently swallow tap events (options highlight on the phone but nothing streams back).
+
 ## Run
 
 ```bash

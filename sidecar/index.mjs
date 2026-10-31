@@ -1,20 +1,20 @@
-// Photon Spectrum sidecar (pi-web-ui iMessage bridge)
+// Hermes Agent — Photon Spectrum sidecar
 //
 // Spawned by `plugins/platforms/photon/adapter.py` to bridge BOTH directions
 // of messaging to Photon's Spectrum platform via the `spectrum-ts` SDK (the
 // SDK is TypeScript-only, so a Node sidecar is unavoidable — there is no
 // Python SDK and no public HTTP message API).
 //
-// Inbound  (gRPC -> host): the SDK's `app.messages` async iterator is a
+// Inbound  (gRPC -> Hermes): the SDK's `app.messages` async iterator is a
 //   long-lived gRPC stream. We serialize each `[space, message]` to a
 //   normalized JSON event and stream it to the Python adapter over a
 //   loopback `GET /inbound` (NDJSON). We pause pulling from the stream while
 //   no consumer is attached so a backlog isn't pulled-and-lost before the
 //   gateway connects.
-// Outbound (host -> gRPC): `/send` drives `space.send(...)`; `/typing`
+// Outbound (Hermes -> gRPC): `/send` drives `space.send(...)`; `/typing`
 //   sends the documented `typing("start" | "stop")` content builder.
 //
-// Protocol (all requests require `X-Photon-Bridge-Token: ${TOKEN}`):
+// Protocol (all requests require `X-Hermes-Sidecar-Token: ${TOKEN}`):
 //   - GET  /inbound    -> 200 NDJSON stream; one JSON event per line, blank
 //                         lines are heartbeats. One consumer at a time.
 //   - POST /healthz     -> {"ok": true}
@@ -60,7 +60,7 @@
 //                          adapter, which holds our stdin pipe — parent-death
 //                          detection so a dead gateway can't orphan us)
 //   PHOTON_TELEMETRY       enable Spectrum SDK telemetry ("true"/"1"/"on"/"yes";
-//                          default off — toggle via the PHOTON_TELEMETRY env var)
+//                          default off — toggle with `hermes photon telemetry`)
 
 import http from "node:http";
 import crypto from "node:crypto";
@@ -195,7 +195,7 @@ function scheduleStreamRestart() {
     }
     console.error(
       `photon-sidecar: upstream stream degraded for ${degradedForMs}ms; ` +
-        "exiting so the host can restart the sidecar"
+        "exiting so Hermes can restart the Photon adapter"
     );
     process.exit(75);
   }, STREAM_DEGRADED_RESTART_MS + 1000);
@@ -279,7 +279,7 @@ if (!projectId || !projectSecret || !sharedToken) {
 }
 
 // Lazy-load spectrum-ts so a missing install fails with a clear message
-// instead of a cryptic module-resolution error during import. Apply the upstream project's
+// instead of a cryptic module-resolution error during import. Apply Hermes'
 // pinned-sdk compatibility patch first so existing installs self-heal at
 // runtime, not only during npm postinstall.
 try {
@@ -346,7 +346,7 @@ const MESSAGE_EFFECTS = imessage?.effect?.message || {};
 // Inbound: forward `app.messages` (gRPC stream) to the Python consumer.
 
 // At most one Python consumer is attached at a time (the gateway adapter).
-let consumerRes = null;
+const consumers = new Set();
 let consumerWaiters = [];
 const knownSpaces = new Map();
 // Inbound Message objects by id, so /react can usually skip a
@@ -397,36 +397,50 @@ function rememberInboundSpace(space, message) {
 }
 
 function waitForConsumer() {
-  if (consumerRes) return Promise.resolve();
+  if (consumers.size > 0) return Promise.resolve();
   return new Promise((resolve) => consumerWaiters.push(resolve));
 }
 
-function setConsumer(res) {
-  consumerRes = res;
+function addConsumer(res) {
+  consumers.add(res);
   const waiters = consumerWaiters;
   consumerWaiters = [];
   for (const resolve of waiters) resolve();
 }
 
-function clearConsumer(res) {
-  if (consumerRes === res) consumerRes = null;
+function removeConsumer(res) {
+  consumers.delete(res);
 }
 
-// Write one NDJSON line to the active consumer. Blocks until a consumer is
-// connected; if the write fails (consumer vanished mid-flight) we wait for a
-// new consumer and retry, so a message is never silently dropped here.
+function clearConsumer(res) {
+  removeConsumer(res);
+}
+
+// Write one NDJSON line to every connected consumer (fan-out, so a debug
+// peek can never steal events from the real host). If nobody is connected
+// we wait; if a write fails mid-flight that consumer is dropped and the
+// line is still delivered to the survivors — a message is never silently
+// dropped while at least one consumer remains.
 async function deliver(line) {
   for (;;) {
-    await waitForConsumer();
-    const res = consumerRes;
-    if (!res) continue;
-    try {
-      const flushed = res.write(line + "\n");
-      if (!flushed) await once(res, "drain");
-      return;
-    } catch {
-      clearConsumer(res);
+    if (consumers.size === 0) {
+      await waitForConsumer();
+      continue;
     }
+    const targets = [...consumers];
+    let delivered = false;
+    const results = await Promise.allSettled(
+      targets.map(async (res) => {
+        const flushed = res.write(line + "\n");
+        if (!flushed) await once(res, "drain");
+      })
+    );
+    results.forEach((r, i) => {
+      if (r.status === "rejected") removeConsumer(targets[i]);
+      else delivered = true;
+    });
+    if (delivered) return;
+    // every write failed: loop and wait for a fresh consumer
   }
 }
 
@@ -670,7 +684,7 @@ function inboundStreamErrorMessage(e) {
   let out = "photon-sidecar: inbound stream errored — restarting: " + msg;
 
   // The Spectrum SDK surfaces Photon cloud CatchUpEvents failures as an
-  // iMessage internal error. Local allowlists cannot cause or fix this:
+  // iMessage internal error. Local Hermes allowlists cannot cause or fix this:
   // inbound messages stop before they reach the gateway. Add an explicit hint
   // so operators know to retry/restart or escalate to Photon support instead
   // of chasing PHOTON_ALLOWED_USERS / pairing configuration.
@@ -684,7 +698,7 @@ function inboundStreamErrorMessage(e) {
   ) {
     out +=
       " | Photon Spectrum CatchUpEvents returned an internal server error; " +
-      "this is upstream of the host, so inbound iMessages may not be delivered " +
+      "this is upstream of Hermes, so inbound iMessages may not be delivered " +
       "until Photon recovers or the stream is re-established.";
   }
   return out;
@@ -931,16 +945,9 @@ function handleInbound(req, res) {
   res.setHeader("Content-Type", "application/x-ndjson");
   res.setHeader("Cache-Control", "no-store");
   res.setHeader("Connection", "keep-alive");
-  // One consumer at a time — a fresh connection (e.g. after a reconnect)
-  // supersedes the previous one.
-  if (consumerRes && consumerRes !== res) {
-    try {
-      consumerRes.end();
-    } catch {
-      /* ignore */
-    }
-  }
-  setConsumer(res);
+  // Fan-out: every connected consumer gets every event (a debug peek can no
+  // longer steal events from the real host).
+  addConsumer(res);
   // Heartbeat keeps the socket warm through idle periods and lets the Python
   // side detect a dead pipe promptly.
   const heartbeat = setInterval(() => {
@@ -1106,7 +1113,7 @@ const server = http.createServer(async (req, res) => {
       const space = await resolveSpace(spaceId);
 
       // spectrum-ts infers name + MIME from the file extension; pass
-      // overrides only when the caller supplied them so a known-good
+      // overrides only when Hermes supplied them so a known-good
       // inference isn't clobbered with an empty string.
       const opts = {};
       if (name) opts.name = name;

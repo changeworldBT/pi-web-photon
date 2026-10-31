@@ -2,7 +2,7 @@
 // Patch spectrum-ts' iMessage inbound mapper until upstream preserves mixed
 // text + attachment Apple events. The mapper returns only
 // buildAttachmentMessage(...) whenever attachments are present, which drops
-// `message.content.text` before the host can see it. We rewrite the two inbound
+// `message.content.text` before Hermes can see it. We rewrite the two inbound
 // mappers — `rebuildFromAppleMessage` (used by `space.getMessage`) and
 // `toInboundMessages` (used by the live stream) — so a bubble carrying both
 // text and attachment(s) surfaces as a group whose first child is the typed
@@ -18,7 +18,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const MARKER = "photon-bridge patch: Preserve mixed text + attachment iMessage payloads";
+const MARKER = "Hermes patch: Preserve mixed text + attachment iMessage payloads";
 
 function scriptDir() {
   return path.dirname(fileURLToPath(import.meta.url));
@@ -51,6 +51,23 @@ function textChild(tabs) {
     `\n${t}\tcontent: asText(text2),\n${t}\tpartIndex: 0,` +
     `\n${t}\tparentId: messageGuidStr\n${t}}`
   );
+}
+
+function patchPollTitle(source) {
+	// Photon can return poll metadata with an empty title (seen on shared-line
+	// polls after a restart), which makes zod's asPoll throw and silently
+	// swallow the user's tap. Fall back to a placeholder.
+	return replaceExactly(
+		source,
+		`const toCachedPoll = (input) => {
+	const poll = asPoll({
+		title: input.title,`,
+		`const toCachedPoll = (input) => {
+	const poll = asPoll({
+		title: input.title || "(poll)",`,
+		1,
+		"toCachedPoll empty-title fallback",
+	);
 }
 
 function patchRebuild(source) {
@@ -133,6 +150,16 @@ export function patchSpectrumTs(root = scriptDir()) {
   for (const file of files) {
     const raw = fs.readFileSync(file, "utf8");
     if (raw.includes(MARKER)) {
+      // Patch 1 already applied on a previous install; still make sure the
+      // poll-title fallback is present (added later than patch 1).
+      let text = raw;
+      const pollAnchor = "title: input.title,";
+      const pollFixed = 'title: input.title || "(poll)",';
+      if (text.includes("const toCachedPoll") && text.includes(pollAnchor)) {
+        text = text.replace(pollAnchor, pollFixed);
+        fs.writeFileSync(file, text, "utf8");
+        return { patched: true, file, reason: "poll-title fallback added" };
+      }
       return { patched: false, file, reason: "already patched" };
     }
     // Normalize to LF for matching so the patch works regardless of the
@@ -151,7 +178,7 @@ export function patchSpectrumTs(root = scriptDir()) {
     // spectrum-ts 12.x replaced the attachment-only branches with
     // `buildUnwrappedContentMessage` + `toOrderedParts`, which already emits a
     // group containing both text and attachments. There is nothing left for
-    // patched here; keep the legacy v8 path below for older pinned installs.
+    // Hermes to patch; keep the legacy v8 path below for older pinned installs.
     if (
       original.includes("const buildUnwrappedContentMessage = async") &&
       original.includes("const parts = toOrderedParts(message.content.text, attachments);")
@@ -162,6 +189,7 @@ export function patchSpectrumTs(root = scriptDir()) {
     patched = patchRebuild(patched);
     patched = patchInbound(patched);
     patched = patchChildIndices(patched);
+    patched = patchPollTitle(patched);
     patched = `// ${MARKER}\n${patched}`;
     if (usedCRLF) {
       patched = patched.split("\n").join(CRLF);
@@ -186,3 +214,4 @@ if (_invokedDirectly) {
     process.exit(1);
   }
 }
+
