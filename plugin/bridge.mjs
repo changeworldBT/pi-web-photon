@@ -56,6 +56,7 @@ export class PhotonBotBridge {
 		this.earlyRuns = new Map();
 		this.dispatches = 0;
 		this.typingHandles = new Map();
+		this.sessionLists = new Map();
 		this.generation = 0;
 		this.userConversations = new Map();
 		this.userWorkspaces = new Map();
@@ -340,7 +341,7 @@ export class PhotonBotBridge {
 				await this.reply(target, "当前会话仍在运行，请等待完成或使用 /stop。");
 				return;
 			}
-			const run = { key, target, text: "", conversationId: this.userConversations.get(key), runId: null, stopTyping };
+			const run = { key, target, text: "", conversationId: this.userConversations.get(key), runId: null, stopTyping, startedAt: Date.now() };
 			this.dispatches++;
 			try {
 				const opts = this.settings.get(key) || {};
@@ -380,6 +381,35 @@ export class PhotonBotBridge {
 			if (!typingOwnedByRun) stopTyping();
 		}
 	}
+	/** Live conversations the host can actually route into (in-memory only:
+	 *  history session files cannot be woken through chatFromPlugin). */
+	async listLiveConversations() {
+		try {
+			const raw = (await this.host.conversations?.list?.()) || [];
+			return (Array.isArray(raw) ? raw : [])
+				.filter((c) => c && c.id)
+				.filter((c) => !c.kind || c.kind === "running")
+				.map((c) => ({ id: String(c.id), title: String(c.title || "(未命名)"), streaming: Boolean(c.isStreaming) }));
+		} catch (error) {
+			this.log("warn", `conversation list failed: ${error.message}`);
+			return [];
+		}
+	}
+	formatDuration(ms) {
+		const s = Math.max(0, Math.round(ms / 1000));
+		if (s < 60) return `${s} 秒`;
+		const m = Math.round(s / 60);
+		if (m < 60) return `${m} 分钟`;
+		return `${Math.round(m / 60)} 小时`;
+	}
+	/** Running state for a conversation: our own dispatched run (with elapsed
+	 *  time) or the host's isStreaming flag for runs started in the WebUI. */
+	conversationState(conversationId, hostStreaming = false) {
+		const run = [...this.pendingRuns.values()].find((r) => r.conversationId === conversationId);
+		if (run) return { streaming: true, label: `运行中 ${this.formatDuration(Date.now() - (run.startedAt || Date.now()))}` };
+		if (hostStreaming) return { streaming: true, label: "运行中（网页端）" };
+		return { streaming: false, label: "空闲" };
+	}
 	async command(text, { key, target, cfg }) {
 		const [raw, ...parts] = text.split(/\s+/),
 			cmd = raw.toLowerCase(),
@@ -389,7 +419,7 @@ export class PhotonBotBridge {
 			case "/help":
 				await this.reply(
 					target,
-					"/help /new /clear /status /stop (/abort) /model [provider/id] /thinking [off|minimal|low|medium|high|xhigh] /cwd [目录]。图片支持 PNG/JPEG/GIF/WebP；语音、视频及文件不自动转录。",
+					"/help /new /clear /sessions /switch <n> /status /stop (/abort) /model [provider/id] /thinking [off|minimal|low|medium|high|xhigh] /cwd [目录]。图片支持 PNG/JPEG/GIF/WebP；语音、视频及文件不自动转录。",
 				);
 				return;
 			case "/model":
@@ -442,12 +472,68 @@ export class PhotonBotBridge {
 			case "/new":
 			case "/clear":
 				break;
-			case "/status":
+			case "/sessions":
+			case "/list": {
+				const convs = await this.listLiveConversations();
+				if (!convs.length) {
+					await this.reply(target, "没有可切换的会话。发条消息或 /new 新建一个。");
+					return;
+				}
+				const current = this.userConversations.get(key) || "";
+				const snapshot = convs.slice(0, 10);
+				this.sessionLists.set(key, snapshot);
+				const lines = snapshot.map((c, i) => {
+					const marks = [];
+					if (c.id === current) marks.push("← 当前");
+					const state = this.conversationState(c.id, c.streaming);
+					if (state.streaming) marks.push(`⏳ ${state.label}`);
+					return `${i + 1}. ${c.title}${marks.length ? `  ${marks.join(" · ")}` : ""}`;
+				});
+				const extra = convs.length > snapshot.length ? `\n（另有 ${convs.length - snapshot.length} 个未显示）` : "";
+				await this.reply(target, `📋 会话（共 ${convs.length}）\n${lines.join("\n")}${extra}\n\n/switch <序号> 切换 · /new 新建`);
+				return;
+			}
+			case "/switch": {
+				if (!arg) {
+					await this.reply(target, "用法：/switch <序号>（先发 /sessions 看列表）或 /switch <会话ID>");
+					return;
+				}
+				if ([...this.pendingRuns.values()].some((r) => r.key === key)) {
+					await this.reply(target, "当前会话仍在运行，请等待完成或使用 /stop 后再切换。");
+					return;
+				}
+				const list = this.sessionLists.get(key) || [];
+				let picked = /^\d+$/.test(arg) ? list[Number(arg) - 1] : null;
+				if (!picked && !/^\d+$/.test(arg)) {
+					const convs = await this.listLiveConversations();
+					picked = convs.find((c) => c.id === arg) || null;
+				}
+				if (!picked) {
+					await this.reply(target, `没有第 ${arg} 个会话。先发 /sessions 刷新列表。`);
+					return;
+				}
+				this.userConversations.set(key, picked.id);
+				const state = this.conversationState(picked.id, picked.streaming);
+				await this.reply(target, `已切换到「${picked.title}」（${state.label}）。下条消息进入该会话。`);
+				return;
+			}
+			case "/status": {
+				const current = this.userConversations.get(key) || "";
+				let title = "尚未创建";
+				let hostStreaming = false;
+				if (current) {
+					const convs = await this.listLiveConversations();
+					const hit = convs.find((c) => c.id === current);
+					title = hit?.title || current;
+					hostStreaming = Boolean(hit?.streaming);
+				}
+				const state = current ? this.conversationState(current, hostStreaming) : { streaming: false, label: "空闲" };
 				await this.reply(
 					target,
-					`状态：${this.status.state}\n会话：${this.userConversations.get(key) || "尚未创建"}\n运行中：${[...this.pendingRuns.values()].some((r) => r.key === key)}\n最近错误：${this.status.lastError || "无"}`,
+					`状态：${this.status.state}\n会话：${title}\n运行中：${state.label}\n最近错误：${this.status.lastError || "无"}`,
 				);
 				return;
+			}
 			default:
 				await this.reply(target, "未知命令。发送 /help 查看支持的命令。");
 				return;
