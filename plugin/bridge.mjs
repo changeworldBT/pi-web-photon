@@ -396,6 +396,8 @@ export class PhotonBotBridge {
 			return (Array.isArray(raw) ? raw : [])
 				.filter((c) => c && c.id)
 				.filter((c) => !c.kind || c.kind === "running")
+				// Subagent conversations are managed in the WebUI, never via iMessage.
+				.filter((c) => c.isSubagent === false || c.isSubagent === undefined)
 				.map((c) => ({ id: String(c.id), title: String(c.title || "(未命名)"), streaming: Boolean(c.isStreaming) }));
 		} catch (error) {
 			this.log("warn", `conversation list failed: ${error.message}`);
@@ -434,12 +436,6 @@ export class PhotonBotBridge {
 			await this.reply(target, "这个投票已过期。重新发 /sessions 获取列表。");
 			return;
 		}
-		// The switch poll ends with a "✕ 移出会话…" item that opens the dismiss
-		// poll instead of switching. Matched by its text, not by its index.
-		if (pending.kind === "switch" && title.startsWith("✕")) {
-			await this.startDismissPoll(key, target);
-			return;
-		}
 		const m = /^(\d+)\.\s*/.exec(title);
 		if (!m) {
 			await this.reply(target, `无法识别选项「${title}」。重新发 /sessions。`);
@@ -468,8 +464,8 @@ export class PhotonBotBridge {
 		const state = this.conversationState(picked.id, picked.streaming);
 		await this.reply(target, `已切换到「${picked.title}」（${state.label}）。下条消息进入该会话。`);
 	}
-	/** Second poll opened from the "✕ 移出会话" item: pick the conversation to
-	 *  dismiss. Running conversations stay listed and are refused when tapped. */
+	/** The dismiss poll behind /remove: pick the conversation to dismiss.
+	 *  Running conversations stay listed and are refused when tapped. */
 	async startDismissPoll(key, target) {
 		// 7 rows + nothing extra stays safely inside the unknown poll cap.
 		const snapshot = (this.sessionLists.get(key) || []).slice(0, 7);
@@ -720,9 +716,8 @@ export class PhotonBotBridge {
 		const convs = await this.listLiveConversations();
 		if (convs.length < 2) return; // nothing to hop between
 		const current = this.userConversations.get(key) || "";
-		// 7 rows + the dismiss toggle = 8 options: safe under any known
-		// provider cap while the upstream limit is unverified.
-		const snapshot = convs.slice(0, 7);
+		// 8 rows, no extra toggle: stays under the (unverified but ≥8) poll cap.
+		const snapshot = convs.slice(0, 8);
 		this.sessionLists.set(key, snapshot);
 		this.pendingPolls.set(key, { kind: "switch" });
 		try {
@@ -734,7 +729,6 @@ export class PhotonBotBridge {
 					if (state.streaming) marks.push("⏳");
 					return `${i + 1}. ${c.title}${marks.length ? `（${marks.join("·")}）` : ""}`;
 				}),
-				"✕ 移出会话（点此进入移出模式）",
 			]);
 		} catch (error) {
 			this.pendingPolls.delete(key);
@@ -747,7 +741,7 @@ export class PhotonBotBridge {
 				return `${i + 1}. ${c.title}${marks.length ? `  ${marks.join(" · ")}` : ""}`;
 			});
 			const extra = convs.length > snapshot.length ? `\n（另有 ${convs.length - snapshot.length} 个未显示）` : "";
-			await this.reply(target, `📋 会话（共 ${convs.length}）\n${lines.join("\n")}${extra}\n\n/switch <序号> 切换\n投票不可用，移出请到网页端左栏点 ✕。`);
+			await this.reply(target, `📋 会话（共 ${convs.length}）\n${lines.join("\n")}${extra}\n\n/switch <序号> 切换；移出会话用 /remove。`);
 		}
 	}
 }
