@@ -111,7 +111,10 @@ export class PhotonBotBridge {
 		ping();
 		const timer = setInterval(ping, TYPING_REFRESH_MS);
 		timer.unref?.();
+		let stopped = false;
 		const stop = () => {
+			if (stopped) return;
+			stopped = true;
 			clearInterval(timer);
 			this.typingHandles.delete(space);
 			photonTyping(sidecar, space, "stop").catch(() => {});
@@ -289,7 +292,6 @@ export class PhotonBotBridge {
 		// attachments and before the model starts, so the sender can tell the
 		// bridge is alive rather than dead.
 		const stopTyping = this.beginTyping(target);
-		let typingOwnedByRun = false;
 		try {
 			const cancelEpoch = this.cancelEpochs.get(key) || 0;
 			const attachments = [];
@@ -348,43 +350,67 @@ export class PhotonBotBridge {
 				await this.reply(target, "当前会话仍在运行，请等待完成或使用 /stop。");
 				return;
 			}
-			const run = { key, target, text: "", conversationId: this.userConversations.get(key), runId: null, stopTyping, startedAt: Date.now() };
-			this.dispatches++;
-			try {
-				const opts = this.settings.get(key) || {};
-				const receipt = await this.host.chat({
-					text: text || "请查看附件",
-					accountId: peerAccountId(`${key}:${this.sessionEpochs.get(key) || 0}`),
-					...(run.conversationId ? { conversationId: run.conversationId } : {}),
-					cwd: this.resolveWorkspace(key, cfg),
-					...(cfg.model ? { model: cfg.model } : {}),
-					...(cfg.thinkingLevel ? { thinkingLevel: cfg.thinkingLevel } : {}),
-					...opts,
-					...(attachments.length ? { attachments } : {}),
-				});
-				if (generation !== this.generation) return;
-				if (cancelEpoch !== (this.cancelEpochs.get(key) || 0)) {
-					if (receipt?.conversationId) await this.host.abortRun?.(receipt.runId || receipt.conversationId);
-					return;
-				}
-				if (!receipt?.conversationId) throw new Error("Host returned no conversation ID");
-				run.conversationId = receipt.conversationId;
-				run.runId = receipt.runId;
-				this.userConversations.set(key, receipt.conversationId);
-				const token = receipt.runId || receipt.conversationId;
-				this.pendingRuns.set(token, run);
-				typingOwnedByRun = true;
-				const early = this.earlyRuns.get(token) || [];
-				this.earlyRuns.delete(token);
-				for (const ev of early) await this.handleRunEvent(ev);
-			} catch (error) {
-				if (generation !== this.generation) return;
-				await this.reply(target, `任务启动失败：${error.message}`);
-			} finally {
-				this.dispatches--;
-				if (!this.dispatches) this.earlyRuns.clear();
-			}
+			await this.startRun({ key, target, text, attachments, cfg, generation, cancelEpoch, stopTyping });
 		} finally {
+			stopTyping();
+		}
+	}
+
+	/** Create the host run for a chat message (extracted so the stale-cwd
+	 *  rebind path can retry without re-processing the inbound event). */
+	async startRun({ key, target, text, attachments, cfg, generation, cancelEpoch, stopTyping, run }) {
+		run = run || { key, target, text: "", conversationId: this.userConversations.get(key), runId: null, stopTyping, startedAt: Date.now() };
+		let typingOwnedByRun = false;
+		const ownTyping = () => {
+			typingOwnedByRun = true;
+		};
+		this.dispatches++;
+		try {
+			const opts = this.settings.get(key) || {};
+			const receipt = await this.host.chat({
+				text: text || "请查看附件",
+				accountId: peerAccountId(`${key}:${this.sessionEpochs.get(key) || 0}`),
+				...(run.conversationId ? { conversationId: run.conversationId } : {}),
+				cwd: this.resolveWorkspace(key, cfg),
+				...(cfg.model ? { model: cfg.model } : {}),
+				...(cfg.thinkingLevel ? { thinkingLevel: cfg.thinkingLevel } : {}),
+				...opts,
+				...(attachments.length ? { attachments } : {}),
+			});
+			if (generation !== this.generation) return;
+			if (cancelEpoch !== (this.cancelEpochs.get(key) || 0)) {
+				if (receipt?.conversationId) await this.host.abortRun?.(receipt.runId || receipt.conversationId);
+				return;
+			}
+			if (!receipt?.conversationId) throw new Error("Host returned no conversation ID");
+			run.conversationId = receipt.conversationId;
+			run.runId = receipt.runId;
+			this.userConversations.set(key, receipt.conversationId);
+			const token = receipt.runId || receipt.conversationId;
+			this.pendingRuns.set(token, run);
+			ownTyping();
+			const early = this.earlyRuns.get(token) || [];
+			this.earlyRuns.delete(token);
+			for (const ev of early) await this.handleRunEvent(ev);
+		} catch (error) {
+			if (generation !== this.generation) return;
+			const staleCwd = /cwd differs/.test(error.message || "");
+			if (staleCwd && run.conversationId && !run.rebound) {
+				// The bound conversation now lives in another project dir (moved
+				// in the WebUI, or the host restarted with a different cwd).
+				// Rebind the channel to a brand-new conversation in OUR cwd and
+				// retry once — the user just wants their message delivered.
+				this.log("warn", `bound conversation ${run.conversationId} changed cwd; rebinding to a fresh one`);
+				this.userConversations.delete(key);
+				this.sessionEpochs.set(key, (this.sessionEpochs.get(key) || 0) + 1);
+				run.conversationId = null;
+				run.rebound = true;
+				return this.startRun({ key, target, text, attachments, cfg, generation, cancelEpoch, stopTyping, run });
+			}
+			await this.reply(target, `任务启动失败：${error.message}`);
+		} finally {
+			this.dispatches--;
+			if (!this.dispatches) this.earlyRuns.clear();
 			if (!typingOwnedByRun) stopTyping();
 		}
 	}
